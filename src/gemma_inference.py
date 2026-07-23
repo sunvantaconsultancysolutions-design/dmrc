@@ -1,0 +1,237 @@
+"""
+gemma_inference.py
+
+Chapter 12.12 -- Gemma 3 Inference Module.
+
+This is the final stage of the RAG pipeline that app.py's /ask endpoint
+currently stops short of:
+
+    User Query
+        |
+        v
+    hybrid_retriever.hybrid_search()   (Chapter 9  -- dense + BM25 + merge)
+        |
+        v
+    reranker.rerank()                  (Chapter 10 -- BGE cross-encoder)
+        |
+        v
+    prompt_engineering.build_prompt()  (Chapter 11 -- prompt assembly)
+        |
+        v
+    gemma_inference.generate_answer()  (Chapter 12.12 -- THIS MODULE)
+        |
+        v
+    JSON response
+
+Scope of this module only:
+    - Load google/gemma-3-12b-it once, lazily, and cache it in memory.
+    - Auto-detect CUDA vs CPU.
+    - Expose generate_answer(prompt) -> str, taking the exact prompt
+      string produced by prompt_engineering.build_prompt() and
+      returning Gemma 3's decoded answer text.
+    - Provide a small CLI for standalone testing (`python -m
+      src.gemma_inference`).
+
+This module does NOT wire itself into app.py, does NOT implement
+streaming, and does NOT implement quantization -- those are explicitly
+out of scope per this chapter and are left for a later chapter.
+"""
+
+import logging
+from typing import Optional, Tuple
+
+import torch
+from transformers import AutoProcessor, Gemma3ForConditionalGeneration
+
+logger = logging.getLogger("dmrc_rag.gemma_inference")
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# google/gemma-3-12b-it is Gemma 3's instruction-tuned 12B checkpoint.
+# The 4B/12B/27B Gemma 3 checkpoints are vision-language models under
+# the hood, so the correct Transformers classes are
+# Gemma3ForConditionalGeneration + AutoProcessor (rather than a plain
+# AutoModelForCausalLM + AutoTokenizer pair, which is only correct for
+# the 1B text-only checkpoint). We only ever feed this module text, so
+# in practice it behaves exactly like a text-in/text-out chat model --
+# the processor's chat template handles pure-text messages fine.
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "google/gemma-3-12b-it"
+
+# 12.6 Generation defaults. Greedy decoding (do_sample=False) is used
+# for reproducible, low-variance answers over contract/engineering
+# text, where consistency matters more than creative variation.
+# NOTE: temperature has no effect when do_sample=False (greedy
+# decoding ignores it); it is kept here, set low, so that flipping
+# do_sample to True later (e.g. for exploratory/creative use) already
+# has a sensible, conservative value in place.
+TEMPERATURE = 0.2
+DO_SAMPLE = False
+MAX_NEW_TOKENS = 512
+
+
+# ---------------------------------------------------------------------------
+# 12.4 Lazy-loaded, cached model + processor
+#
+# Mirrors the pattern already used by query.get_model() (Chapter 7/9)
+# and reranker.get_reranker_model() (Chapter 10): nothing is loaded at
+# import time. The first call to get_gemma_model() pays the (large,
+# multi-second-to-multi-minute) load cost; every subsequent call reuses
+# the same in-memory model and processor via these module-level
+# caches, so a FastAPI warm-up hook (Chapter 14.9) can call this once
+# at startup, or the first real request can trigger the load lazily.
+# ---------------------------------------------------------------------------
+
+_model: Optional[Gemma3ForConditionalGeneration] = None
+_processor: Optional[AutoProcessor] = None
+_device: Optional[str] = None
+
+
+def _select_device() -> str:
+    """GPU auto-detection: use CUDA if a GPU is visible to PyTorch,
+    otherwise fall back to CPU. Gemma 3 12B is large enough that CPU
+    inference will be slow, but it should still work correctly -- this
+    module never hard-requires a GPU.
+    """
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        logger.info("CUDA GPU detected (%s); using device='cuda'.", device_name)
+        return "cuda"
+    logger.info("No CUDA GPU detected; falling back to device='cpu'.")
+    return "cpu"
+
+
+def get_gemma_model() -> Tuple[Gemma3ForConditionalGeneration, AutoProcessor, str]:
+    """Initialize (on first call) and return the cached
+    (model, processor, device) triple.
+
+    Lazy loading: the tokenizer/processor and the 12B-parameter model
+    weights are only pulled from disk/Hugging Face Hub and placed on
+    the GPU/CPU the first time this function is called. Every later
+    call -- from generate_answer(), from a FastAPI warm-up hook, or
+    from the CLI below -- returns the same cached objects instead of
+    reloading them, since reloading a 12B model per-request would be
+    far too slow for real-time question answering.
+    """
+    global _model, _processor, _device
+
+    if _model is not None and _processor is not None and _device is not None:
+        return _model, _processor, _device
+
+    _device = _select_device()
+
+    logger.info("Loading Gemma 3 processor: %s", MODEL_NAME)
+    _processor = AutoProcessor.from_pretrained(MODEL_NAME)
+
+    # bfloat16 on GPU keeps memory/latency reasonable for a 12B model;
+    # on CPU we let PyTorch pick a safe default float dtype instead,
+    # since bfloat16 CPU kernels are inconsistently supported.
+    torch_dtype = torch.bfloat16 if _device == "cuda" else torch.float32
+
+    logger.info("Loading Gemma 3 model: %s (dtype=%s, device=%s)", MODEL_NAME, torch_dtype, _device)
+    _model = Gemma3ForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch_dtype,
+        device_map="auto" if _device == "cuda" else None,
+    ).eval()
+
+    # device_map="auto" already places the model correctly when a GPU
+    # is present; on CPU there's no device_map, so move explicitly.
+    if _device == "cpu":
+        _model = _model.to(_device)
+
+    logger.info("Gemma 3 model and processor loaded and cached.")
+    return _model, _processor, _device
+
+
+# ---------------------------------------------------------------------------
+# 12.12 Inference -- prompt in, decoded answer string out
+# ---------------------------------------------------------------------------
+
+def generate_answer(prompt: str) -> str:
+    """Run Gemma 3 inference on a fully-assembled prompt string.
+
+    Args:
+        prompt: The complete prompt produced by
+            prompt_engineering.build_prompt() (retrieved context +
+            question, already formatted). This function does not
+            construct or modify the prompt in any way -- it treats it
+            as a single opaque user message.
+
+    Returns:
+        The generated answer as a plain string, with the input prompt
+        and any special tokens stripped out (i.e. only the newly
+        generated continuation, decoded).
+    """
+    model, processor, device = get_gemma_model()
+
+    # The chat template wraps the raw prompt string as a single user
+    # turn. Gemma 3's processor understands plain-text-only messages
+    # (no "image" content needed) and returns a dict of tensors ready
+    # for model.generate(), exactly as it would for a multimodal turn.
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}],
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device, dtype=model.dtype)
+
+    input_length = inputs["input_ids"].shape[-1]
+
+    # inference_mode disables gradient tracking, which we never need
+    # here and which would otherwise waste memory/compute.
+    with torch.inference_mode():
+        generation = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=DO_SAMPLE,
+            temperature=TEMPERATURE,
+        )
+
+    # model.generate() returns the full sequence (prompt tokens +
+    # newly generated tokens) concatenated together. Slicing off the
+    # first `input_length` tokens keeps only what Gemma 3 actually
+    # generated, so callers get just the answer -- not their own
+    # prompt echoed back to them.
+    new_tokens = generation[0][input_length:]
+
+    answer = processor.decode(new_tokens, skip_special_tokens=True)
+    return answer.strip()
+
+
+# ---------------------------------------------------------------------------
+# CLI -- standalone manual testing: `python -m src.gemma_inference`
+# ---------------------------------------------------------------------------
+
+def _run_cli() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+    print(f"Gemma 3 inference CLI -- model: {MODEL_NAME}")
+    print("Loading model (this can take a while on first run)...")
+    get_gemma_model()  # warm up once, up front, so the prompt below isn't the first (slow) call
+    print("Model loaded. Type a prompt and press Enter. Ctrl+C to exit.\n")
+
+    try:
+        while True:
+            prompt = input("Prompt> ").strip()
+            if not prompt:
+                continue
+            answer = generate_answer(prompt)
+            print(f"\nAnswer:\n{answer}\n")
+    except KeyboardInterrupt:
+        print("\nExiting.")
+
+
+if __name__ == "__main__":
+    _run_cli()
