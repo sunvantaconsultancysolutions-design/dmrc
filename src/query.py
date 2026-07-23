@@ -9,6 +9,7 @@ embedding pipeline, it never writes to it. Covers Chapter 8.10
 """
 
 import argparse
+import re
 
 from sentence_transformers import SentenceTransformer
 
@@ -100,6 +101,111 @@ def search(query: str, top_k: int = 5, metadata_filter: dict = None):
         )
 
     return formatted
+
+
+# ---------------------------------------------------------------------------
+# NEW -- Exact Clause-Number Fast Path
+#
+# Problem: dense retrieval (semantic similarity on chunk TEXT) and BM25
+# (lexical term matching on chunk TEXT) both rank candidates by how well
+# the query's *wording* matches the chunk's wording -- neither one does an
+# exact lookup against the `clause_no` metadata field. So a query like
+# "Explain Clause 1.2.1" can fail to rank the 1.2.1 chunk first, even
+# though some chunk's metadata says clause_no == "1.2.1" verbatim.
+#
+# Fix: before hybrid retrieval runs at all, check whether the query names
+# an explicit clause number. If it does, do a metadata-only ChromaDB
+# lookup (collection.get(where=...), NOT collection.query()) -- this
+# needs no embedding, no BM25, and always finds the clause if it exists.
+# This does not touch embeddings, bm25_index.py, hybrid_retriever.py, or
+# metadata_loader.py. If no exact match is found, the caller (app.py)
+# falls back to the existing hybrid_search() pipeline unchanged.
+# ---------------------------------------------------------------------------
+
+# Matches clause numbers like "1.2.1", "6.8.2", "6.7.2-1", "6.7.2.1":
+# one or more digits followed by 1-4 more separator+digits groups, where
+# the separator can be "." or "-" since users type both forms naturally
+# (the metadata loader's normalized form uses "." but the as-authored
+# clause label may use "-"). Requires at least one separator so a bare
+# number ("Section 5", "page 3") is never mistaken for a clause number.
+CLAUSE_NO_PATTERN = re.compile(r"\b(\d+(?:[.-]\d+){1,4})\b")
+
+
+def extract_clause_no(query_text: str):
+    """Return the first clause-number-shaped token found in `query_text`,
+    exactly as typed (e.g. "6.7.2-1" out of "Explain Clause 6.7.2-1", or
+    "6.7.2.1" out of "Explain Clause 6.7.2.1"), or None if the query
+    doesn't contain one. Accepts both "." and "-" separators. Pure string
+    matching -- no model call, no DB call, no normalization here (that
+    happens in get_chunk_by_clause_no, only if the as-typed form doesn't
+    match anything).
+    """
+    match = CLAUSE_NO_PATTERN.search(query_text)
+    return match.group(1) if match else None
+
+
+def get_chunk_by_clause_no(clause_no: str):
+    """Exact metadata lookup for a clause number, bypassing dense/BM25
+    retrieval entirely.
+
+    Users may type a clause number with either separator (e.g.
+    "6.7.2-1" or "6.7.2.1"), and the metadata loader may store the
+    as-authored form under `clause_no` (e.g. "6.7.2-1") while keeping a
+    dot-normalized form under `clause_no_normalized` (e.g. "6.7.2.1").
+    To support both input styles without touching metadata_loader.py or
+    re-ingesting any data, this tries two lookups in order:
+
+        1. where={"clause_no": clause_no}                   (as typed)
+        2. where={"clause_no_normalized": normalized_clause} ("-" -> ".")
+
+    Only falls through to the second lookup if the first finds nothing,
+    so a corpus that only ever populates `clause_no` (never
+    `clause_no_normalized`) still works unchanged.
+
+    Uses collection.get(where=...) rather than collection.query(...):
+    .get() is ChromaDB's metadata-only accessor (no query embedding, no
+    ANN search), which is exactly what an exact clause match needs.
+
+    Returns a list of candidate dicts shaped to match
+    hybrid_retriever.merge_candidates()'s output (chunk_id, document,
+    metadata, score, retrieval_source, dense_score, bm25_score) so it can
+    be fed straight into the existing rerank() / build_prompt() /
+    _build_sources() code with no changes to any of them. Returns []
+    if no chunk carries this clause number under either field, so the
+    caller falls back to hybrid_search() exactly as before.
+    """
+    collection = get_collection()
+
+    result = collection.get(
+        where={"clause_no": clause_no},
+        include=["documents", "metadatas"],
+    )
+
+    if not result.get("ids"):
+        normalized_clause_no = clause_no.replace("-", ".")
+        result = collection.get(
+            where={"clause_no_normalized": normalized_clause_no},
+            include=["documents", "metadatas"],
+        )
+
+    ids = result.get("ids", [])
+    documents = result.get("documents", [])
+    metadatas = result.get("metadatas", [])
+
+    candidates = []
+    for chunk_id, document, metadata in zip(ids, documents, metadatas):
+        candidates.append(
+            {
+                "chunk_id": chunk_id,
+                "document": document,
+                "metadata": metadata,
+                "score": 1.0,  # exact metadata match -- highest possible confidence
+                "retrieval_source": "exact_clause_match",
+                "dense_score": None,
+                "bm25_score": None,
+            }
+        )
+    return candidates
 
 
 def print_results(query: str, results: list):
