@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from .hybrid_retriever import hybrid_search
 from .prompt_engineering import NO_CONTEXT_ANSWER, build_prompt, has_usable_context
 from .query import get_model as get_dense_model
+from .query import extract_clause_no, get_chunk_by_clause_no
 from .reranker import get_reranker_model, rerank
 from . import query as query_module
 from . import reranker as reranker_module
@@ -269,26 +270,55 @@ def ask(request: QueryRequest) -> AnswerResponse:
     Gemma 3 generation):
 
         1. Validate the request.                       (FastAPI + Pydantic)
-        2. Hybrid retrieval over ChromaDB + BM25.       -> hybrid_search()
-        3. Rerank the merged candidates.                -> rerank()
-        4. Build the final LLM prompt.                  -> build_prompt()
-        5. Generate the answer.                         -> generate_answer()
-        6. Return the answer + sources as JSON.
+        2. NEW: exact clause-number fast path.          -> get_chunk_by_clause_no()
+           If the query names a clause number found verbatim in
+           ChromaDB's metadata, use that match directly and skip
+           hybrid retrieval entirely. Otherwise fall through to step 3
+           exactly as before.
+        3. Hybrid retrieval over ChromaDB + BM25.       -> hybrid_search()
+        4. Rerank the candidates.                       -> rerank()
+        5. Build the final LLM prompt.                  -> build_prompt()
+        6. Generate the answer.                         -> generate_answer()
+        7. Return the answer + sources as JSON.
     """
     query_text = request.query.strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="`query` must not be empty.")
 
-    try:
-        candidates = hybrid_search(
-            query_text,
-            top_k_dense=DENSE_TOP_K,
-            top_k_bm25=BM25_TOP_K,
-            final_top_k=MERGED_CANDIDATE_POOL,
-        )
-    except Exception as exc:
-        logger.error("Hybrid retrieval failed for query: %r", query_text, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
+    # ----------------------------------------------------------------
+    # NEW: Exact clause-number fast path (see query.py's
+    # extract_clause_no()/get_chunk_by_clause_no() docstrings for the
+    # full rationale). Dense + BM25 rank on chunk TEXT, not on the
+    # `clause_no` metadata field, so an exact clause reference like
+    # "Explain Clause 1.2.1" can still fail to surface that clause
+    # first. Checking metadata directly for an exact match up front
+    # fixes that without touching embeddings, BM25, or the merge logic.
+    #
+    # `candidates` is deliberately left empty (rather than raising) on
+    # a clause-lookup failure or "clause named but not found in the
+    # corpus" -- either case just means we fall back to the existing
+    # hybrid_search() pipeline below, unchanged.
+    # ----------------------------------------------------------------
+    candidates: List[Dict[str, Any]] = []
+    clause_no = extract_clause_no(query_text)
+    if clause_no:
+        try:
+            candidates = get_chunk_by_clause_no(clause_no)
+        except Exception:
+            logger.exception("Exact clause lookup failed for clause_no: %r", clause_no)
+            candidates = []
+
+    if not candidates:
+        try:
+            candidates = hybrid_search(
+                query_text,
+                top_k_dense=DENSE_TOP_K,
+                top_k_bm25=BM25_TOP_K,
+                final_top_k=MERGED_CANDIDATE_POOL,
+            )
+        except Exception as exc:
+            logger.error("Hybrid retrieval failed for query: %r", query_text, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
 
     try:
         reranked = rerank(query_text, candidates, top_n=RERANK_TOP_N)
