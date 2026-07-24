@@ -46,6 +46,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from .bm25_index import rebuild_bm25_index
 from .hybrid_retriever import hybrid_search
 from .prompt_engineering import NO_CONTEXT_ANSWER, build_prompt, has_usable_context
 from .query import get_model as get_dense_model
@@ -261,6 +262,31 @@ def _build_sources(reranked_candidates: List[Dict[str, Any]]) -> List[SourceItem
 
 
 # ---------------------------------------------------------------------------
+# POST /admin/reload-bm25 -- BUGFIX: manual fix for BM25 staleness.
+#
+# bm25_index.get_bm25_index() builds once per process and caches the
+# result; dense search hits ChromaDB live on every call so it always
+# sees new data, but BM25 does not. Call this endpoint once after any
+# ingestion run (e.g. once BOQ rows are added) so BM25 catches up
+# without needing to restart the whole server.
+# ---------------------------------------------------------------------------
+
+class ReloadBM25Response(BaseModel):
+    status: str
+    chunks_indexed: int
+
+
+@app.post("/admin/reload-bm25", response_model=ReloadBM25Response)
+def reload_bm25() -> ReloadBM25Response:
+    try:
+        index = rebuild_bm25_index()
+    except Exception as exc:
+        logger.error("BM25 index rebuild failed.", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"BM25 rebuild failed: {exc}") from exc
+    return ReloadBM25Response(status="reloaded", chunks_indexed=len(index.chunk_ids))
+
+
+# ---------------------------------------------------------------------------
 # POST /ask -- 12.6 / 12.11 / 12.12 Question Answering Endpoint
 # ---------------------------------------------------------------------------
 
@@ -308,7 +334,21 @@ def ask(request: QueryRequest) -> AnswerResponse:
             logger.exception("Exact clause lookup failed for clause_no: %r", clause_no)
             candidates = []
 
-    if not candidates:
+    # BUGFIX: track whether `candidates` came from the exact-metadata
+    # match, not from hybrid_search()/rerank(). An exact clause_no hit
+    # is already the highest-confidence result possible (score=1.0, set
+    # in get_chunk_by_clause_no) -- running it through the cross-encoder
+    # anyway wastes a GPU call AND overwrites that confidence with a
+    # near-zero raw reranker_score (the model is scoring one full
+    # question against one short clause in isolation, which legitimately
+    # produces tiny logits -- observed 0.0011/0.0022 in testing). That
+    # score then leaks into the API response's `sources[].reranker_score`
+    # with nothing in the payload to explain it, making an exact clause
+    # match look like ~0.1% confidence to any caller. Skip reranking
+    # entirely on this path instead.
+    exact_match = bool(candidates)
+
+    if not exact_match:
         try:
             candidates = hybrid_search(
                 query_text,
@@ -320,11 +360,14 @@ def ask(request: QueryRequest) -> AnswerResponse:
             logger.error("Hybrid retrieval failed for query: %r", query_text, exc_info=True)
             raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
 
-    try:
-        reranked = rerank(query_text, candidates, top_n=RERANK_TOP_N)
-    except Exception as exc:
-        logger.error("Reranking failed for query: %r", query_text, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Reranking failed: {exc}") from exc
+    if exact_match:
+        reranked = [dict(c, reranker_score=c.get("score", 1.0)) for c in candidates]
+    else:
+        try:
+            reranked = rerank(query_text, candidates, top_n=RERANK_TOP_N)
+        except Exception as exc:
+            logger.error("Reranking failed for query: %r", query_text, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Reranking failed: {exc}") from exc
 
     # 11.14 Handling Missing Information -- no reason to build a prompt
     # (or call an LLM) if retrieval found nothing at all.
