@@ -1,6 +1,13 @@
 sentence-transformers==3.0.1
-transformers==4.44.2
-torch==2.4.1
+# BUGFIX: 4.44.2 predates Gemma3ForConditionalGeneration entirely
+# (gemma_inference.py's import fails immediately with it) -- pin to a
+# floor that has it instead of an exact old version.
+transformers>=4.50.0
+# BUGFIX: torch 2.4.1 doesn't ship torch.distributed.tensor.DTensor,
+# which recent transformers/accelerate import at module load time.
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
 chromadb==0.5.5
 numpy==1.26.4
 tqdm==4.66.5
@@ -9,4 +16,15 @@ fastapi==0.115.0
 uvicorn==0.30.6
 pydantic==2.9.2
 
-accelerate==0.34.2
+accelerate>=1.0.0
+sentencepiece==0.2.2
+
+# BUGFIX: bm25_index.py imports this; it was missing entirely, which is
+# why `python -m src.hybrid_retriever` failed with ModuleNotFoundError.
+rank-bm25==0.2.2
+
+# 4-bit quantized Gemma 3 loading (gemma_inference.py). nvidia-nvjitlink-cu13
+# works around bitsandbytes-foundation#1905 (libnvJitLink.so.13 dlopen
+# failure) on some Colab CUDA builds.
+bitsandbytes>=0.43.0
+nvidia-nvjitlink-cu13
