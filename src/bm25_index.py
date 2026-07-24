@@ -179,6 +179,24 @@ def get_bm25_index() -> BM25Index:
     return _bm25_index_instance
 
 
+def rebuild_bm25_index() -> BM25Index:
+    """BUGFIX: force a fresh BM25Index from the current ChromaDB
+    collection, replacing the cached singleton.
+
+    get_bm25_index() only ever builds once per process and never
+    notices new chunks written by an ingestion script afterwards --
+    dense search hits ChromaDB live on every call so it sees new data
+    immediately, but BM25 silently keeps searching a stale snapshot
+    until the process restarts. Call this once after any ingestion run
+    (e.g. after BOQ rows are added) so BM25 and dense retrieval stay in
+    sync. Also exposed as POST /admin/reload-bm25 in app.py.
+    """
+    global _bm25_index_instance
+    with _bm25_index_lock:
+        _bm25_index_instance = build_bm25_index()
+    return _bm25_index_instance
+
+
 if __name__ == "__main__":
     # Minimal manual smoke test: build the index against the real
     # collection and run one query.
