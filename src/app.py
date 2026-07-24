@@ -40,12 +40,19 @@ API layer.
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from . import retrieval_caps  # noqa: F401 -- side-effect import, must run
+                                # before hybrid_search/rerank are called
+                                # below so RAG_MAX_CANDIDATES/RAG_MAX_CONTEXT
+                                # actually cap retrieval breadth (see
+                                # retrieval_caps.py's docstring)
 from .bm25_index import rebuild_bm25_index
 from .hybrid_retriever import hybrid_search
 from .prompt_engineering import NO_CONTEXT_ANSWER, build_prompt, has_usable_context
@@ -176,6 +183,28 @@ app = FastAPI(
     title="DMRC Contract Intelligence",
     version="1.0",
     lifespan=lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# CORS -- the React frontend is deployed separately (e.g. Vercel) from this
+# API (e.g. a RunPod GPU pod), so browser requests are cross-origin by
+# definition. ALLOWED_ORIGINS is a comma-separated env var so the deployed
+# frontend URL never has to be hardcoded here; "*" is only a local-dev
+# fallback and should be overridden in production.
+# ---------------------------------------------------------------------------
+
+_allowed_origins = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
 )
 
 
