@@ -51,8 +51,10 @@ GEMMA_USE_4BIT=0 in the environment to disable and load full
 bfloat16 precision instead.
 """
 
+import glob
 import logging
 import os
+import site
 from typing import Optional, Tuple
 
 import torch
@@ -65,6 +67,51 @@ except ImportError:  # bitsandbytes not installed
     _BITSANDBYTES_AVAILABLE = False
 
 logger = logging.getLogger("dmrc_rag.gemma_inference")
+
+
+def _fixup_nvjitlink_ld_library_path() -> None:
+    """Best-effort workaround for a known bitsandbytes/Colab issue
+    (bitsandbytes-foundation#1905): recent bitsandbytes builds dlopen
+    libnvJitLink.so.13 (a CUDA 13 runtime lib), but it's frequently not
+    on the dynamic linker's search path even when the pip package that
+    ships it (nvidia-nvjitlink-cu13) is installed, because dlopen'd
+    transitive dependencies rely on LD_LIBRARY_PATH rather than the
+    package's own location. This searches site-packages for the file
+    and, if found, prepends its directory to LD_LIBRARY_PATH *before*
+    bitsandbytes is ever imported (import happens lazily, inside
+    get_gemma_model() below, the first time 4-bit loading is
+    attempted). Purely additive -- if nothing is found, this is a
+    no-op, and get_gemma_model() falls back to full precision anyway
+    if bitsandbytes still can't load.
+    """
+    try:
+        search_roots = list(site.getsitepackages())
+        try:
+            search_roots.append(site.getusersitepackages())
+        except Exception:
+            pass
+
+        found_dirs = set()
+        for root in search_roots:
+            for pattern in ("libnvJitLink.so.13", "libnvJitLink.so.13.*"):
+                found_dirs.update(
+                    os.path.dirname(p)
+                    for p in glob.glob(os.path.join(root, "**", pattern), recursive=True)
+                )
+
+        if not found_dirs:
+            return
+
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        new_path = os.pathsep.join([*found_dirs, current]) if current else os.pathsep.join(found_dirs)
+        os.environ["LD_LIBRARY_PATH"] = new_path
+        logger.info("Added to LD_LIBRARY_PATH for bitsandbytes: %s", found_dirs)
+    except Exception:
+        # Never let this best-effort fixup break model loading.
+        logger.debug("nvJitLink LD_LIBRARY_PATH fixup failed (non-fatal).", exc_info=True)
+
+
+_fixup_nvjitlink_ld_library_path()
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +216,33 @@ def get_gemma_model() -> Tuple[Gemma3ForConditionalGeneration, AutoProcessor, st
     else:
         logger.info("Loading Gemma 3 model: %s (dtype=%s, device=%s)", MODEL_NAME, torch_dtype, _device)
 
-    _model = Gemma3ForConditionalGeneration.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch_dtype,
-        device_map="auto" if _device == "cuda" else None,
-        quantization_config=quantization_config,
-    ).eval()
+    try:
+        _model = Gemma3ForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch_dtype,
+            device_map="auto" if _device == "cuda" else None,
+            quantization_config=quantization_config,
+        ).eval()
+    except Exception:
+        if quantization_config is None:
+            raise  # not a quantization issue -- a real failure, don't hide it
+        # 4-bit loading failed (e.g. a bitsandbytes/CUDA library mismatch
+        # like bitsandbytes-foundation#1905 -- libnvJitLink.so.13 not
+        # found on this particular Colab GPU/CUDA build). Don't let an
+        # environment-specific quantization problem crash the whole
+        # notebook: fall back to full-precision bfloat16 instead.
+        logger.warning(
+            "4-bit quantized load of %s failed; falling back to full bfloat16 "
+            "precision. Set GEMMA_USE_4BIT=0 to skip the 4-bit attempt entirely "
+            "next time.",
+            MODEL_NAME,
+            exc_info=True,
+        )
+        _model = Gemma3ForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch_dtype,
+            device_map="auto" if _device == "cuda" else None,
+        ).eval()
 
     # device_map="auto" already places the model correctly when a GPU
     # is present; on CPU there's no device_map, so move explicitly.
