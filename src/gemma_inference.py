@@ -32,16 +32,37 @@ Scope of this module only:
     - Provide a small CLI for standalone testing (`python -m
       src.gemma_inference`).
 
-This module does NOT wire itself into app.py, does NOT implement
-streaming, and does NOT implement quantization -- those are explicitly
-out of scope per this chapter and are left for a later chapter.
+This module does NOT wire itself into app.py and does NOT implement
+streaming -- those are explicitly out of scope per this chapter and
+are left for a later chapter.
+
+4-bit quantization (bitsandbytes) is now used by default on GPU: it
+cuts each loaded copy of Gemma 3 12B from ~24GB down to ~7-8GB of
+VRAM, and speeds up generation, with a small, usually-unnoticeable
+quality tradeoff for extractive/QA-style answers over retrieved
+context. This also matters operationally: if this module ever ends
+up loaded twice on the same GPU (e.g. once in a notebook kernel for
+testing, once again in a server subprocess started from that same
+notebook), two 4-bit copies still comfortably fit on a single 40GB
+GPU, whereas two full-precision bf16 copies do not -- and running out
+of headroom is exactly what causes silent slowdowns/timeouts on
+larger-context (free-text, non-clause) queries. Set
+GEMMA_USE_4BIT=0 in the environment to disable and load full
+bfloat16 precision instead.
 """
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
 from transformers import AutoProcessor, Gemma3ForConditionalGeneration
+
+try:
+    from transformers import BitsAndBytesConfig
+    _BITSANDBYTES_AVAILABLE = True
+except ImportError:  # bitsandbytes not installed
+    _BITSANDBYTES_AVAILABLE = False
 
 logger = logging.getLogger("dmrc_rag.gemma_inference")
 
@@ -71,6 +92,11 @@ MODEL_NAME = "google/gemma-3-12b-it"
 TEMPERATURE = 0.2
 DO_SAMPLE = False
 MAX_NEW_TOKENS = 512
+
+# Load in 4-bit (bitsandbytes) on GPU by default -- see module docstring.
+# Falls back to full bfloat16 automatically if bitsandbytes isn't
+# installed, or if GEMMA_USE_4BIT=0 is set in the environment.
+USE_4BIT = _BITSANDBYTES_AVAILABLE and os.environ.get("GEMMA_USE_4BIT", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +157,23 @@ def get_gemma_model() -> Tuple[Gemma3ForConditionalGeneration, AutoProcessor, st
     # since bfloat16 CPU kernels are inconsistently supported.
     torch_dtype = torch.bfloat16 if _device == "cuda" else torch.float32
 
-    logger.info("Loading Gemma 3 model: %s (dtype=%s, device=%s)", MODEL_NAME, torch_dtype, _device)
+    quantization_config = None
+    if _device == "cuda" and USE_4BIT:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        logger.info("Loading Gemma 3 model: %s (4-bit nf4 quantized, device=%s)", MODEL_NAME, _device)
+    else:
+        logger.info("Loading Gemma 3 model: %s (dtype=%s, device=%s)", MODEL_NAME, torch_dtype, _device)
+
     _model = Gemma3ForConditionalGeneration.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch_dtype,
         device_map="auto" if _device == "cuda" else None,
+        quantization_config=quantization_config,
     ).eval()
 
     # device_map="auto" already places the model correctly when a GPU
